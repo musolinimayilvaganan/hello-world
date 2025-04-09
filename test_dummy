@@ -1,0 +1,270 @@
+# -*-coding:utf-8-*-
+import sys
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, to_date, hour, col
+from pyspark.sql.utils import StreamingQueryException
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType
+from pyspark.sql.functions import when
+import logging
+from Utilities import Utilities
+
+
+def main():
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.info('::::::::::: Logger initialized :::::::::::')
+
+    # Instantiate Utilities Class and access methods for reading schema and  flatten nested schema
+    util = Utilities(logger)
+    # Read the config file parameter passed from the spark_submit.sh script
+    config_file = sys.argv[1]
+    application_name = sys.argv[2]
+    logger.info("***************************config_file***************************")
+    logger.info(config_file)
+    logger.info("***************************application_name***************************")
+    logger.info(application_name)
+    # Read the configuration dictionary with keys and values
+    # job_variables = util.get_config_dict(config_file, "CONFIG")
+
+    job_variables = util.get_config_dict(config_file, "CONFIG")
+
+    # Start the spark session
+    spark = SparkSession.builder.appName(application_name).getOrCreate()
+    spark.sparkContext.setLogLevel("INFO")
+    logger.info('::::::::::: spark session initiated :::::::::::')
+    # Read the stream from kafka topic
+
+    logger.info("Reading from Kafka Topic")
+    sasl_flag = job_variables.get("sasl_enabled")
+    logger.info("sasl flag is ....")
+    logger.info(sasl_flag)
+    try:
+
+        if sasl_flag:
+            # This section of read stream code has to be modified with the correct SSL/SASL configurations
+            logger.info("****Reading from SSL Kafka Topic****")
+            brokers = job_variables.get("kafka_brokers")
+            topic = job_variables.get("kafka_topic")
+            logger.info(brokers)
+            logger.info(topic)
+
+            streaming_rawdata = (spark
+                                 .readStream
+                                 .format("kafka")
+                                 .option("kafka.bootstrap.servers", brokers)
+                                 .option("subscribe", topic)
+                                 .option("startingOffsets", job_variables.get("kafka_offset"))
+                                 .option("kafka.security.protocol", job_variables.get("security_protocol"))
+                                 .option("kafka.ssl.endpoint.identification.algorithm", job_variables.get("ssl_endpoint_identification_algorithm"))
+                                 .option("kafka.ssl.truststore.location", job_variables.get("ssl_truststore_loc"))
+                                 .option("kafka.ssl.truststore.password", job_variables.get("ssl_truststore_password"))
+                                 .option("checkpointLocation", job_variables.get("kafka_checkpoint"))
+                                 .option("failOnDataLoss", job_variables.get("fail_on_data_loss"))
+                                 .option("maxOffsetsPerTrigger", job_variables.get("max_offsets"))
+                                 .option("fetchOffset.retryIntervalMs", "100")
+                                 .option("fetchOffset.numRetries", "10")
+                                 .option("spark.streaming.backpressure.enabled", "true")
+                                 .option("spark.streaming.backpressure.initialRate", "100")
+                                 .option("kafkaConsumer.pollTimeoutMs", "60000")
+                                 .option("includeTimestamp", "true")
+                                 .load())
+        else:
+            logger.info("****Reading from non SSL Kafka Topic****")
+            streaming_rawdata = (spark
+                                 .readStream
+                                 .format("kafka")
+                                 .option("kafka.bootstrap.servers", job_variables.get("kafka_brokers"))
+                                 .option("subscribe", job_variables.get("kafka_topic"))
+                                 .option("startingOffsets", job_variables.get("kafka_offset"))
+                                 .option("checkpointLocation", job_variables.get("kafka_checkpoint"))
+                                 .option("failOnDataLoss", job_variables.get("fail_on_data_loss"))
+                                 .option("maxOffsetsPerTrigger", job_variables.get("max_offsets"))
+                                 .option("fetchOffset.retryIntervalMs", "100")
+                                 .option("fetchOffset.numRetries", "10")
+                                 .option("spark.streaming.backpressure.enabled", "true")
+                                 .option("spark.streaming.backpressure.initialRate", "100")
+                                 .option("kafkaConsumer.pollTimeoutMs", "60000")
+                                 .option("includeTimestamp", "true")
+                                 .load())
+
+    except Exception as e:
+        logger.error(e)
+    logger.info("Print kafka topic schema")
+    streaming_rawdata.printSchema()
+    logger.info("Casting Kafka topic input from binary to string")
+    # Need to cast the kafka message to string otherwise this will come as binary data
+    streaming_rawdata_to_string = streaming_rawdata.selectExpr("CAST(value AS STRING)",
+                                                               "CAST(partition AS STRING)", "CAST(offset AS STRING)",
+                                                               "CAST(timestamp AS STRING)")
+    logger.info("Adding date & time partitions to raw data")
+    # Extract the kafka topic into Raw Data Frame, Add two new columns Date and Hour for partitioning
+    kafka_rawdata_final_df = streaming_rawdata_to_string.withColumn("date", to_date("timestamp")) \
+        .withColumn("hour", hour(streaming_rawdata_to_string.timestamp))
+
+    logger.info("Printing kafka dataframe schema")
+    kafka_rawdata_final_df.printSchema()
+
+    # Write raw data to hdfs file location partitioned by day and hour
+
+    try:
+        (kafka_rawdata_final_df.writeStream
+         .format(job_variables.get("output_writer_format"))
+         .partitionBy("date", "hour")
+         .outputMode(outputMode="append")
+         .option("compression", job_variables.get("output_writer_compression"))
+         .option("checkpointLocation", job_variables.get("rawdata_checkpoint"))
+         .option("path", job_variables.get("rawdata_path"))
+         .trigger(processingTime=job_variables.get("batch_interval"))
+         .start())
+    except Exception as e:
+        logger.error(e)
+
+    # get the input schema from the schema file
+    logger.info("Read the input schema path from config to parse the raw data")
+    input_schema = util.get_schema(job_variables.get("input_schema_path"))
+    logger.info("Input schema path:{}".format(input_schema))
+
+    logger.info("Flattening parsed data based on input schema")
+
+    # Extract the DataFrame from raw data using json schema file and flatten any nested schema structures
+    try:
+        flattened_schema = util.flatten(input_schema, "value")
+        # add date and hour partition columns to the schema
+        flattened_schema.append("date")
+        flattened_schema.append("hour")
+        final_flattened_schema = util.re_arrange_schema(flattened_schema, job_variables.get("additional_columns"))
+        logger.info("Final Flattened schema: {}".format(final_flattened_schema))
+
+        input_df = kafka_rawdata_final_df.select("date", "hour", col("value").alias("raw_value"),
+                                                 from_json("value", schema=input_schema).alias("value"))
+        filtered_df = input_df.filter(input_df.value.isNotNull())
+        corrupt_df = input_df.filter(input_df.value.isNull()).select("date", "raw_value")      
+        final_input_df = filtered_df.select(final_flattened_schema).withColumn("mrv_version", when(col("curl").contains("mrvPOS"),"Omni").otherwise("Classic"))
+        print("successfully flattened the schema") 
+    except Exception as e:
+        logger.error(e)
+
+    #logger.info("Print parsed dataframe schema along with day and hour partitions")
+    final_input_df.printSchema()
+
+    logger.info("Writing parsed data to the HDFS file locations based on day and hour partitions")
+    # write the parsed data to the given hdfs destination path using orc     format and Snappy compression
+
+    try:
+        (final_input_df.writeStream
+         .format(job_variables.get("output_writer_format"))
+         .partitionBy("date", "hour")
+         .outputMode(outputMode="append")
+         .option("compression", job_variables.get("output_writer_compression"))
+         .option("checkpointLocation", job_variables.get("parsed_data_checkpoint"))
+         .option("path", job_variables.get("parsed_data_path"))
+         .trigger(processingTime=job_variables.get("batch_interval"))
+         .start())
+    except Exception as e:
+        logger.error(e)
+
+    # Write corrupt data to the hdfs file location
+    try:
+        (corrupt_df.writeStream
+         .format(job_variables.get("output_writer_format"))
+         .partitionBy("date")
+         .outputMode(outputMode="append")
+         .option("path", job_variables.get("corrupt_data_path"))
+         .option("checkpointLocation", job_variables.get("corrupt_data_checkpoint"))
+         .trigger(processingTime=job_variables.get("batch_interval"))
+         .start())
+    except Exception as e:
+        logger.error(e)
+
+    try:
+        spark.streams.awaitAnyTermination()
+    except StreamingQueryException as e:
+        print(e)
+    except Exception as e:
+        print(e)
+
+    # Program ends here
+    logger.info('::::::::::: Awaiting Spark Session Termination:::::::::::')
+
+
+# Program starts here
+if __name__ == "__main__":
+    main()
+----------------------------------------------------------------------------------
+#!/usr/bin/env bash
+
+########################################################################################################################
+#Script Name : sparkSubmit.sh
+#Description : Submits Spark job for mrv contact_center jobs
+#Usage: sh spark_submit.sh <data_source><application_name><pyspark_deploy_path><log_path><master><deploy_mode><num_executors><num_cpu_cores><executor_memory>
+# <driver_memory><data_source_env><queue><kerbKeyTab><kerbServiceUser>
+
+#sh spark_submit.sh "assisted_checkout" "assisted_checkout_streaming" "/home/c8925485/mrv-analytics-tech-data/src/main/com/lowes/mrv"\
+# "/home/c8925485/logs" "yarn" "cluster" "2" "4" "2G" "2G" "dev" "default" "/lowes/servicekeys/my_red_vest/svcmrveprdrw.keytab" "svcmrveprdrw@LOWES.COM"
+
+########################################################################################################################
+# Exit if correct number of parameters aren't provided
+if [[ $# -ne 15 ]]; then
+    echo "Please provide correct number of parameters" >&2
+    exit 2
+fi
+
+#****************************** ARGUMENTS ******************************
+# arguments passed to shell script
+
+pyspark_file=spark_job.py
+data_source=$1
+application_name=$2
+pyspark_deploy_path=$3
+log_path=$4
+master=$5
+deploy_mode=$6
+num_executors=$7
+num_cpu_cores=$8
+executor_memory=$9
+driver_memory=${10}
+data_source_env=${11}
+truststore_jks_file_name=${12}
+queueName=${13}
+kerbKeyTab=${14}
+kerbServiceUser=${15}
+
+# Configuration file names based on environment
+
+config_file=${data_source}'_config.cfg'
+schema_file=${data_source}'_schema.json'
+
+if [ ${data_source_env} == "dev" ] || [ ${data_source_env} == "stg" ]
+then
+   log_file=${log_path}/${data_source}'_'${data_source_env}'_'`date --utc +"%Y%m%d-%H%M%S"`'.log'
+else
+   log_file=${log_path}/${data_source}'_'`date --utc +"%Y%m%d-%H%M%S"`'.log'
+fi
+echo " ---------------- Start of spark streaming ----------------- " >$log_file
+
+chmod 755 $log_file
+#****************************** SUBMIT SPARK JOB ************************
+
+spark3-submit --master ${master}\
+ --name ${application_name}\
+ --deploy-mode ${deploy_mode}\
+ --num-executors=${num_executors}\
+ --executor-cores=${num_cpu_cores}\
+ --executor-memory=${executor_memory}\
+ --conf spark.yarn.queue=${queueName}\
+ --conf spark.yarn.keytab=${kerbKeyTab}\
+ --conf spark.yarn.principal=${kerbServiceUser}@LOWES.COM\
+ --driver-memory=${driver_memory}\
+ --py-files ${pyspark_deploy_path}/common/Utilities.py\
+ --files ${pyspark_deploy_path}/${data_source}/schema/${schema_file},${pyspark_deploy_path}/${data_source}/config/${data_source_env}/${config_file},${pyspark_deploy_path}/truststore/${truststore_jks_file_name}\
+   ${pyspark_deploy_path}/common/$pyspark_file $config_file ${application_name}\
+ >> $log_file 2>&1 &
+
+sleep 180
+
+application_id=$(grep -oP 'application_\d+_\d+' $log_file)
+
+echo "$application_id"
+
+#****************************** END OF SCRIPT ***************************
