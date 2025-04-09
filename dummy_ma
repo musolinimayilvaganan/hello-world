@@ -1,0 +1,122 @@
+from etlbase_spark import EtlBase
+# from utils import Utils
+from dq_transform import DQTransforms
+from custom_logger import CustomLogger
+
+
+class DqReporting(EtlBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.app_name = job_args.app_name
+
+    @CustomLogger.exception_handler_decorator
+    def run(self):
+        app_name = self.app_name
+        job_args = self.read_args()
+        env = job_args.env
+        yaml_filename = job_args.yaml_filename
+        config = self.get_yaml_config(yaml_filename)
+        self.logger.info(config['environments'][env]
+                         ['application_name'][app_name])
+        read_yaml_config = config['environments'][env]
+        job_config = read_yaml_config['application_name'][app_name]
+        database_config = read_yaml_config['database_config']
+
+        # Setting start and end date
+        start_date = job_args.start_date if str(
+            job_args.start_date) != 'None' else self.get_yesterday_date(date_format="%Y-%m-%d")
+        end_date = job_args.end_date if str(
+            job_args.end_date) != 'None' else self.get_yesterday_date(date_format="%Y-%m-%d")
+
+        # Loop through the dates - start_date to end_date.
+        for current_date_key in self.date_range(start_date, end_date):
+            self.logger.info(
+                "Procesing data quality checks for date = " + current_date_key)
+
+            self.dq_checks_etl(app_name, current_date_key,
+                               job_config, database_config)
+            self.logger.info(
+                "Done processing data quality checks for date = " + current_date_key)
+        self.done()
+
+    @CustomLogger.exception_handler_decorator
+    def read_source_config_data(self, app_name, config_table_name, source_table_name, date_key, driver, jdbc_url, user, password, parsed_files_location):
+        config_df = self.read_config_table(
+            config_table_name=config_table_name, app_name=app_name)
+        source_df = self.read_source_table(table_name=source_table_name, parsed_files_location=parsed_files_location,
+                                           filter_condition='date', date_key=date_key, driver=driver, jdbc_url=jdbc_url, user=user, password=password)
+        source_df = source_df.dropDuplicates()
+
+        source_df.show(10, False)
+        config_df.show(30, False)
+
+        return source_df, config_df
+
+    @CustomLogger.exception_handler_decorator
+    def dq_checks_etl(self, app_name, date_key, job_config, database_config):
+        database_name = "lowes_streaming"
+        config_table_name = job_config['config_table_name']
+        parsed_table_name = job_config['parsed_table_name']
+        curated_table_name = job_config['curated_table_name']
+        error_table_name = job_config['error_table_name']
+        curated_table_location = job_config['curated_table_location']
+        error_table_location = job_config['error_table_location']
+        file_split = job_config['file_split']
+        num_of_splits = job_config['number_of_splits']
+        partition_column = job_config['partition_column']
+        er_partition_column = job_config['er_partition_column']
+        error_table_schema = job_config['error_table_schema']
+        new_columns = job_config['new_columns']
+        temp_data_path = job_config['temp_data_path']
+        create_table = job_config['create_table']
+        parsed_files_location = job_config['parsed_table_location']
+
+        # database config details
+        driver = database_config['driver']
+        jdbc_url = database_config['trino_url']
+        user = database_config['user']
+        password = database_config['password']
+
+        if app_name == "MCO":
+            curated_table_schema = job_config['mco_schema']
+        else:
+            curated_table_schema = job_config['canonical_schema']
+
+        source_df, config_df = self.read_source_config_data(
+            app_name,
+            config_table_name,
+            parsed_table_name,
+            date_key,
+            driver,
+            jdbc_url,
+            user,
+            password,
+            parsed_files_location
+        )
+
+        curated_df, error_df = DQTransforms(
+            app_name, self.logger).run_data_quality_checks(source_df, config_df, new_columns)
+
+        if curated_df.count() > 0 or error_df.count() > 0:
+            # write the curated and error tables
+
+            self.write(df=curated_df, date=date_key, partition_column=partition_column, location=curated_table_location,
+                       file_split=file_split, num_of_splits=num_of_splits, curated_table_name=curated_table_name, temp_data_path=temp_data_path)
+            self.error_write(df=error_df, partition_column=er_partition_column, location=error_table_location,
+                             file_split=file_split, num_of_splits=num_of_splits, partition_value=date_key)
+
+            # create the curated and error tables
+        if create_table:
+            self.check_and_create_table(database_name, curated_table_name,
+                                        curated_table_schema, curated_table_location, partition_column)
+            self.check_and_create_table(
+                database_name, error_table_name, error_table_schema, error_table_location, er_partition_column)
+        else:
+            self.logger.info("No records found for the given date range")
+
+
+if __name__ == "__main__":
+    etl_base = EtlBase()
+    job_args = etl_base.read_args()
+    driver = DqReporting(job_args=job_args)
+    driver.run()
