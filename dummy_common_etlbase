@@ -1,0 +1,424 @@
+--etlbase
+  # ----------------------------------------------------------------------------------------------------------------------
+# Script Name   :   mrva_etlbase.py
+##
+# Arguments     ;   None
+##
+# Description   :   This script contains all the base functions that requires for main job to run.
+##
+# Change Log
+# ----------------------------------------------------------------------------------------------------------------------
+# Created/Modified Date      Created/Modified By         Description (jira#, if applicable)          Version
+# ----------------------------------------------------------------------------------------------------------------------
+# March 16 2023              Hari Siliveri               Initial Creation - SPUT-16703                1.0
+# ----------------------------------------------------------------------------------------------------------------------
+
+from pyspark.sql.functions import row_number
+from pyspark.sql.window import Window
+from custom_logger import CustomLogger
+import argparse
+import datetime
+import logging
+import yaml
+import subprocess
+
+from datetime import datetime, timedelta
+from pyspark.conf import SparkConf
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql.functions import col, coalesce, to_date, lit
+from pyspark.sql import functions as F
+
+logger = logging.getLogger(__name__)
+logger.info('::::::::::: Logger initialized :::::::::::')
+
+
+class EtlBase:
+    def __init__(self, app_name=None, spark_configs=[], init_spark=True, *args, **kwargs):
+        self.logger = CustomLogger(f"ETLBase").get_logger()
+        self.app_name = None
+        self.__sc = None
+
+        if app_name is not None:
+            self.init_job(app_name=app_name)
+
+        if init_spark:
+            self.init_spark(app_name=app_name, spark_configs=spark_configs)
+
+    def init_job(self, app_name=None):
+        self.set_app_name(app_name)
+
+    def set_app_name(self, app_name):
+        self.app_name = app_name
+
+    @CustomLogger.exception_handler_decorator
+    def init_spark(self, app_name=None, spark_configs=[]):
+        if len(spark_configs) == 0:
+            spark_configs = [
+                ('spark.app.name', app_name),
+                ('spark.driver.memory', '2g'),
+                ('spark.executor.memory', '2g'),
+                ('spark.executor.cores', '2'),
+                ('spark.default.parallelism', '200'),
+                ('spark.sql.shuffle.partitions', '200'),
+                ('spark.shuffle.compress', 'true'),
+                ('spark.shuffle.spill.compress', 'true'),
+                ('spark.broadcast.compress', 'true'),
+                ('spark.rdd.compress', 'true'),
+                ('spark.io.compression.codec', 'snappy'),
+                ('spark.sql.autoBroadcastJoinThreshold', '10485760'),
+                ('spark.driver.maxResultSize', '3g'),
+                ('spark.sql.sources.partitionOverwriteMode', 'dynamic'),
+                ("hive.exec.dynamic.partition.mode", "nonstrict")
+            ]
+
+        else:
+            spark_configs.append(('spark.app.name', app_name))
+
+        spark_conf = SparkConf().setAll(spark_configs)
+        self.__sc = SparkContext.getOrCreate(conf=spark_conf)
+
+    @CustomLogger.exception_handler_decorator
+    def get_spark_session(self):
+        spark_session = SparkSession.builder \
+            .appName(self.app_name) \
+            .getOrCreate()
+
+        return spark_session
+
+    @CustomLogger.exception_handler_decorator
+    def read_args(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--start_date", help="start date to run", required=False)
+        parser.add_argument(
+            "--end_date", help="end date to run", required=False)
+        parser.add_argument("--yaml_filename",
+                            help="yaml_filename", required=False)
+        parser.add_argument(
+            "--env", help="env to run dev, stg or prod", required=False)
+        parser.add_argument(
+            "--app_name", help="app_name is job name or application name", required=False)
+        parser.add_argument(
+            "--table_name", help="parsed_or-curated_table_name", required=False)
+        parser.add_argument("--temp_location_path",
+                            help="temp_location_path", required=False)
+        args = parser.parse_args()
+        return args
+
+    @CustomLogger.exception_handler_decorator
+    def yaml_to_dict(self, yaml_file):
+        try:
+            with open(yaml_file, 'r') as stream:
+                return yaml.safe_load(stream)
+        except FileNotFoundError as e:
+            self.logger.error(f"File not found: {yaml_file}")
+            self.logger.error(e)
+        except yaml.YAMLError as e:
+            self.logger.error(f"Error parsing YAML file: {yaml_file}")
+            self.logger.error(e)
+        except Exception as e:
+            self.logger.error(f"Unexpected error with YAML file: {yaml_file}")
+            self.logger.error(e)
+
+        return None
+
+    def get_yaml_config(self, yaml_file):
+        config = self.yaml_to_dict(yaml_file)
+        print("config", config)
+        return config
+
+    @CustomLogger.exception_handler_decorator
+    def executeSQL_spark(self, query):
+        try:
+            final_df = self.get_spark_session().sql(query)
+        except Exception as err:
+            logger.error(err)
+
+    def getCurrentDate(self, date_format="%Y-%m-%d"):
+        """Returns the current date in the given format"""
+        return datetime.now().strftime(date_format)
+
+    def get_yesterday_date(self, date_format="%Y-%m-%d"):
+        """Returns yesterday's date in the specified format"""
+        yesterday = datetime.now() - timedelta(days=1)
+        return yesterday.strftime(date_format)
+
+    def get_offset_date(self, day_offset=0, date_format="%Y-%m-%d"):
+        """Returns the date with the specified offset from today's date in the specified format"""
+        date = datetime.now() + timedelta(days=day_offset)
+        return date.strftime(date_format)
+
+    def date_range(self, start_date, end_date, date_format="%Y-%m-%d"):
+        """Returns a list of dates between the start_date and end_date in the specified format"""
+        dates = []
+        current_date = datetime.strptime(start_date, date_format).date()
+        end_date = datetime.strptime(end_date, date_format).date()
+
+        while current_date <= end_date:
+            dates.append(current_date.strftime(date_format))
+            current_date += timedelta(days=1)
+
+        return dates
+
+    @CustomLogger.exception_handler_decorator
+    def read_csv_files_from_location(self, location):
+        df = self.get_spark_session().read.format("csv").load(location)
+        return df
+
+    @CustomLogger.exception_handler_decorator
+    def read_orc_files_from_location(self, location):
+        df = self.get_spark_session().read.format("orc").load(location)
+        return df
+
+    @CustomLogger.exception_handler_decorator
+    def read_adhoc_source_table(self, table_name, date_key):
+        if "parsed" in table_name:
+            df = self.get_spark_session().sql(
+                """select * from lowes_streaming.{0} where date in ('{1}') """.format(table_name, date_key))
+        else:
+            df = self.get_spark_session().sql(
+                """select * from lowes_streaming.{0} where tp_date in ('{1}') """.format(table_name, date_key))
+        return df
+
+    @CustomLogger.exception_handler_decorator
+    def read_source_table(self, table_name, filter_condition, date_key, parsed_files_location, driver=None, jdbc_url=None, user=None, password=None):
+
+        if self.app_name in ['Assisted_Checkout', 'Self_Checkout', 'Showroom']:
+            self.logger.info(f"app_name is: {self.app_name}")
+            # print rge parsed_files_location
+            self.logger.info(
+                f"parsed_files_location: {parsed_files_location}/date={date_key}")
+
+            self.get_spark_session().conf.set("spark.sql.files.ignoreCorruptFiles", "true")
+
+            df = self.get_spark_session().read \
+                .option("mode", "DROPMALFORMED") \
+                .orc(f"{parsed_files_location}/date={date_key}")
+            # print the count of the dataframe
+            print("The count of the dataframe is", df.count())
+
+            # print show of the dataframe
+            df.show(10, False)
+            # add the date key to the above df as with column
+            df = df.withColumn("date", lit(date_key))
+            # df = df.withColumn("tp_date", to_date(col("tp")))
+            # shuffling logic to swap data and hour
+            existing_columns = df.columns
+            index_date = existing_columns.index('date')
+            index_hour = existing_columns.index('hour')
+            # Swap the positions
+            existing_columns[index_date], existing_columns[index_hour] = existing_columns[index_hour], existing_columns[index_date]
+            df = df.select(*existing_columns)
+            self.logger.info(f"reordered columns: {existing_columns}")
+            # print shcema of the dataframe
+            self.logger.info("schema after adding date")
+            df = df.withColumn("hour", col("hour").cast("string"))
+            df.printSchema()
+        else:
+            self.logger.info(f"app_name is: {self.app_name}")
+            print("filter_condition", filter_condition)
+            print("date_key", date_key)
+            date_value = date_key.replace('-', '')
+            print("The value of date_value is", date_value)
+            query = f"""(SELECT *, cast(CONCAT(regexp_replace("date",'-',''),LPAD(hour, 2, '0')) as integer) AS date_hour_combined_date FROM lowes_streaming.{table_name}
+                WHERE {filter_condition} in ('{date_key}')) AS t"""
+            print(f"""(SELECT *, cast(CONCAT(regexp_replace("date",'-',''),LPAD(hour, 2, '0')) as integer) AS date_hour_combined_date FROM lowes_streaming.{table_name}
+                WHERE {filter_condition} in ('{date_key}')) AS t""")
+            df = self.get_spark_session().read.format("jdbc") \
+                .option("driver", driver) \
+                .option("url", jdbc_url) \
+                .option("user", user) \
+                .option("password", password) \
+                .option("dbtable", query) \
+                .option("partitionColumn", 'date_hour_combined_date') \
+                .option("numPartitions", "24") \
+                .option("lowerBound", f"{date_value}00") \
+                .option("upperBound", f"{date_value}23") \
+                .option("SSLVerification", "NONE") \
+                .option("SSL", "True") \
+                .load()
+            df = df.drop("date_hour_combined_date")
+        if self.app_name == 'MCO':
+            df = df.withColumn("tp_date", to_date(col("timestamp")))
+        else:
+            df = df.withColumn("tp_date", to_date(col("tp")))
+        return df
+
+    @CustomLogger.exception_handler_decorator
+    def read_config_table(self, config_table_name, app_name):
+        table_columns_df = self.get_spark_session().sql("""select dq_rule_mpg_id, app_nm, dq_rule_dtl_nm, schema_clmn_nm, mandate_flg from lowes_streaming.{0}\
+                                        where  actv_flg = 'Y' and app_nm = '{1}'""".format(config_table_name, app_name))
+        return table_columns_df
+
+    @CustomLogger.exception_handler_decorator
+    def error_write(self, df, format="orc", partition_column=None, location=None, mode="overwrite",
+                    file_split="coalesce", num_of_splits=1, curated_table_name=None, write_to_table=None,
+                    partition_value=None):
+        if file_split == 'coalesce' and num_of_splits >= 1:
+            df = df.coalesce(num_of_splits)
+        elif file_split == 'repartition' and num_of_splits >= 1:
+            df = df.repartition(num_of_splits)
+        if partition_column and partition_value:
+            partition_path = f"{partition_column}={partition_value}"
+            table_path = f"{location}/{partition_path}"
+            df.write.format(format).mode(mode).save(table_path)
+        elif partition_column:
+            unique_partitions = df.select(
+                partition_column).distinct().collect()
+            for partition in unique_partitions:
+                partition_value = partition[0]
+                partition_path = f"{partition_column}={partition_value}"
+                table_path = f"{location}/{partition_path}"
+                partitioned_df = df.filter(
+                    df[partition_column] == partition_value)
+                partitioned_df.write.format(format).mode(mode).save(table_path)
+        elif partition_column and write_to_table:
+            partitioned_table = "lowes_streaming." + curated_table_name
+            df.write.format(format).mode(mode).insertInto(partitioned_table)
+        else:
+            df.write.format(format).mode(mode).save(location)
+
+    def move_with_cleanup_and_overwrite(self, source_path, destination_path, destination_path_delete):
+        """Move a file from source HDFS path to destination HDFS path with cleanup and overwrite.
+           source_path: temp path
+           destination_path: final path"""
+        try:
+            # Move the file with overwrite
+            subprocess.check_call(
+                ['hdfs', 'dfs', '-rm', '-r', destination_path_delete])
+            print(
+                f"Successfully cleaned up destination_path for the tp_date: {destination_path}")
+
+            subprocess.check_call(
+                ['hadoop', 'fs', '-cp', '-f', source_path, destination_path])
+            print(
+                f"Successfully moved '{source_path}' to '{destination_path}' with overwrite.")
+
+            # Clean source_path path
+            subprocess.check_call(['hdfs', 'dfs', '-rm', '-r', source_path])
+            print(f"Successfully cleaned up staging area: {source_path}")
+
+        except subprocess.CalledProcessError as e:
+            print(f"Error: {str(e)}")
+
+    def drop_duplicates(self, df):
+        all_columns = df.columns
+        columns_to_exclude = ['generatedid', 'kafka_date', 'kafka_hour']
+        partitioning_columns = [
+            col for col in all_columns if col not in columns_to_exclude]
+        window_spec = Window.partitionBy(
+            partitioning_columns).orderBy('kafka_date', 'kafka_hour')
+        final_df = df.withColumn("rn", row_number().over(
+            window_spec)).filter("rn = 1").drop("rn")
+        return final_df
+
+    @CustomLogger.exception_handler_decorator
+    def write(self, df, date, partition_column=None, location=None, file_split="coalesce", num_of_splits=1,
+              curated_table_name=None, temp_data_path=None):
+        try:
+            tp_dates = df.select("tp_date").distinct(
+            ).rdd.flatMap(lambda x: x).collect()
+
+            # Write directly without initial repartitioning
+            df.write.partitionBy("tp_date").mode(
+                "append").format("orc").save(location)
+
+            for tp_date in tp_dates:
+                tp_date = tp_date.strftime("%Y-%m-%d")
+
+                existing_data_path = f"{location}/tp_date={tp_date}"
+                existing_data = self.read_orc_files_from_location(
+                    existing_data_path)
+                final_df = existing_data.withColumn(
+                    "tp_date", to_date(lit(tp_date)))
+                final_df = self.drop_duplicates(final_df)
+
+                # Apply repartitioning to final_df before writing
+                if file_split == "repartition":
+                    final_df = final_df.repartition(num_of_splits)
+                elif file_split == "coalesce":
+                    final_df = final_df.coalesce(num_of_splits)
+
+                final_df.write.partitionBy("tp_date").mode(
+                    "overwrite").format("orc").save(temp_data_path)
+
+                source_path = f"{temp_data_path}/tp_date={tp_date}"
+                destination_path = location
+                destination_path_delete = existing_data_path
+                self.move_with_cleanup_and_overwrite(
+                    source_path, destination_path, destination_path_delete)
+            return df
+        except Exception as e:
+            print(f"An error occurred: {str(e)}")
+            return None
+
+    @CustomLogger.exception_handler_decorator
+    def check_and_create_table(self, database_name, table_name, table_schema, table_location, partition_column=None):
+        if not self.get_spark_session().catalog._jcatalog.tableExists(database_name, table_name):
+            print(
+                f"Table {database_name}.{table_name} does not exist. Creating it...")
+            create_table_sql = f"""
+            CREATE EXTERNAL TABLE {database_name}.{table_name} (
+                {table_schema}
+            )
+            PARTITIONED BY ({partition_column} string) STORED AS ORC
+            LOCATION '{table_location}'
+            TBLPROPERTIES ('discover.partitions' = 'true','orc.stripe.size'='16777216');
+            """
+
+            repair_table_sql = f"MSCK REPAIR TABLE {database_name}.{table_name}"
+
+            self.logger.info(f"create_table_sql: {create_table_sql}")
+
+            self.get_spark_session().sql(create_table_sql)
+            print(f"Table {database_name}.{table_name} created.")
+            print(
+                f"Table {database_name}.{table_name} exists. Running MSCK REPAIR TABLE...")
+            self.get_spark_session().sql(repair_table_sql)
+        else:
+            print(
+                f"Table {database_name}.{table_name} exists. Running MSCK REPAIR TABLE...")
+            repair_table_sql = f"MSCK REPAIR TABLE {database_name}.{table_name}"
+            self.get_spark_session().sql(repair_table_sql)
+            print(
+                f"MSCK REPAIR TABLE completed for {database_name}.{table_name}")
+
+    @CustomLogger.exception_handler_decorator
+    def compute_partition_statistics(self, database_name, table_name, partition_column):
+        analyze_query = f"ANALYZE TABLE {database_name}.{table_name} PARTITION({partition_column}) COMPUTE STATISTICS"
+        print(f"analyze_query: {analyze_query}")
+        self.get_spark_session().sql(analyze_query)
+        self.logger.info(
+            f"Computed statistics for all partitions in table {table_name} using column {partition_column}")
+
+    # job done methods or error handling
+    def done(self):
+        print("job_done")
+
+    def error(self, err):
+        print(err)
+        print("job failed")
+
+    # Below method is used to read the query from the file and run the materilized view.
+    @CustomLogger.exception_handler_decorator
+    def cleanup_older_files(self, partition_column, hdfs_location, hive_table, retention_period):
+        try:
+            sel_dates = "select distinct cast({partition_column} as string) from lowes_streaming.{hive_table} where {partition_column} < current_date - interval '{retention_period}' day".format(
+                partition_column=partition_column, hive_table=hive_table, retention_period=retention_period)
+            dates_df = self.spark.sql(sel_dates).rdd.map(
+                lambda r: tuple(r)).collect()
+            conv_str = [''.join(i) for i in dates_df]
+
+            for val in conv_str:
+                destination_path_delete = hdfs_location+"/"+partition_column+"="+val
+                subprocess.check_call(
+                    ['hdfs', 'dfs', '-rm', '-r', destination_path_delete])
+
+            print(
+                f"Successfully cleaned up destination_path for the {partition_column}: {hdfs_location}")
+            return 'success'
+        except subprocess.CalledProcessError as e:
+            print(f"Error: {str(e)}")
